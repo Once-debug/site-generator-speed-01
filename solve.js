@@ -22,9 +22,25 @@
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
-/** `text` with & < > " and ' escaped. (The scan lives in the regex engine: a hand loop over code units is slower.) */
+const ESCAPE_RE = /[&<>"']/g;
+
+/**
+ * `text` with & < > " and ' escaped. The regex engine finds the specials; the runs between them are copied
+ * whole. (A replace with a callback pays a call per special, and a hand loop over code units is slower still.)
+ * The shared regex's lastIndex is safe here: the scan finishes before anything can call escapeHtml again.
+ */
 function escapeHtml(text) {
-  return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+  ESCAPE_RE.lastIndex = 0;
+  let m = ESCAPE_RE.exec(text);
+  if (m === null) return text;
+  let out = '';
+  let start = 0;
+  while (m !== null) {
+    out += text.slice(start, m.index) + ESCAPES[m[0]];
+    start = m.index + 1;
+    m = ESCAPE_RE.exec(text);
+  }
+  return out + text.slice(start);
 }
 
 const SLUG_MAX = 64;
@@ -39,7 +55,18 @@ function slugifyRaw(text) {
   }
   let out;
   if (ascii) {
-    out = text.replace(/[A-Z]/g, (c) => c.toLowerCase()).replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+    // One pass: A-Z lowered, a-z and 0-9 kept, a run of anything else becomes one "-" (never at either end).
+    out = '';
+    let gap = false;
+    for (let i = 0; i < text.length; i++) {
+      let c = text.charCodeAt(i);
+      if (c >= 65 && c <= 90) c += 32;
+      if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
+        if (gap && out.length > 0) out += '-';
+        gap = false;
+        out += String.fromCharCode(c);
+      } else gap = true;
+    }
   } else {
     const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
     out = '';
@@ -71,10 +98,17 @@ function uniqueSlug(slug, taken) {
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
-/** A YYYY-MM-DD date in words, from the string alone: "2026-11-09" is "9 November 2026". */
+const longDateCache = new Map();
+
+/** A YYYY-MM-DD date in words, from the string alone: "2026-11-09" is "9 November 2026". (Dates repeat across a site's posts, so each is worded once and kept.) */
 function longDate(date) {
-  const [y, m, d] = date.split('-');
-  return `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
+  let out = longDateCache.get(date);
+  if (out === undefined) {
+    const [y, m, d] = date.split('-');
+    out = `${Number(d)} ${MONTHS[Number(m) - 1]} ${y}`;
+    longDateCache.set(date, out);
+  }
+  return out;
 }
 
 /** Whether `code` is one of the code units JavaScript's \s matches (the set the reference's word count splits on). */
@@ -86,12 +120,17 @@ function isSpaceCode(code) {
   );
 }
 
+/** isSpaceCode's answers for the Latin-1 range, tabulated: the word count tests every character of every body. */
+const SPACE_TAB = new Uint8Array(256);
+for (let c = 0; c < 256; c++) SPACE_TAB[c] = isSpaceCode(c) ? 1 : 0;
+
 /** The number of words in `text`: its runs of characters other than whitespace, counted without building them. */
 function countWords(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (isSpaceCode(text.charCodeAt(i))) inWord = false;
+    const code = text.charCodeAt(i);
+    if (code < 256 ? SPACE_TAB[code] === 1 : isSpaceCode(code)) inWord = false;
     else if (!inWord) {
       inWord = true;
       n++;
@@ -342,16 +381,24 @@ function trimLine(line) {
   return a === 0 && b === line.length ? line : line.slice(a, b);
 }
 
-/** Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. */
+/**
+ * Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. Each construct
+ * opens on its own first character, so the first character picks the one check that can hold.
+ */
 function endsParagraph(line) {
-  return isBlankLine(line) || fenceLang(line) !== null || headingOf(line) !== null || isBreak(line);
+  const c0 = line.charCodeAt(0);
+  if (c0 === 0x60) return fenceLang(line) !== null;
+  if (c0 === 0x23) return headingOf(line) !== null;
+  if (c0 === 0x2d || c0 === 0x2a) return isBreak(line);
+  if (line === '' || c0 === 0x20 || c0 === 0x09) return isBlankLine(line);
+  return false;
 }
 
 /**
  * `src` read block by block and rendered in the same pass — no token objects between the reading and the
  * rendering. Returns the HTML (each block on its own lines, a "\n" after the last), the table of contents
- * (every level 2 and 3 heading: level, id and its inline HTML) and the excerpt (the first paragraph's inline
- * HTML, or ""). `slug` is the build's memoised slug rule.
+ * (every level 2 and 3 heading: level, id and its inline HTML), the excerpt (the first paragraph's inline
+ * HTML, or "") and the body's word count. `slug` is the build's memoised slug rule.
  */
 function renderMarkdown(src, env, slug) {
   const lines = src.split('\n');
@@ -359,6 +406,10 @@ function renderMarkdown(src, env, slug) {
   const toc = [];
   let excerpt = null;
   let html = '';
+  // The body's word count, taken while its lines are in hand: a word never spans a line (the "\n" between
+  // lines is whitespace to the count), so the per-line counts add up to the whole body's.
+  let words = 0;
+  for (const line of lines) words += countWords(line);
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
@@ -366,7 +417,10 @@ function renderMarkdown(src, env, slug) {
       i++;
       continue;
     }
-    const lang = fenceLang(line);
+    // Each construct below opens on its own first character; the guard keeps the checks that cannot
+    // hold for this line from being called at all.
+    const c0 = line.charCodeAt(0);
+    const lang = c0 === 0x60 ? fenceLang(line) : null;
     if (lang !== null) {
       let inner = '';
       i++;
@@ -376,7 +430,7 @@ function renderMarkdown(src, env, slug) {
       html += `<pre><code${cls}>${inner}</code></pre>\n`;
       continue;
     }
-    const heading = headingOf(line);
+    const heading = c0 === 0x23 ? headingOf(line) : null;
     if (heading !== null) {
       const id = uniqueSlug(slug(heading.text), ids);
       const inner = inline(heading.text, env);
@@ -385,12 +439,12 @@ function renderMarkdown(src, env, slug) {
       i++;
       continue;
     }
-    if (isBreak(line)) {
+    if ((c0 === 0x2d || c0 === 0x2a) && isBreak(line)) {
       html += '<hr>\n';
       i++;
       continue;
     }
-    if (line.charCodeAt(0) === 0x3e) {
+    if (c0 === 0x3e) {
       const body = [];
       while (i < lines.length && lines[i].charCodeAt(0) === 0x3e) {
         const raw = lines[i++];
@@ -400,7 +454,7 @@ function renderMarkdown(src, env, slug) {
       html += body.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(body.join('\n'), env)}</p>\n</blockquote>\n`;
       continue;
     }
-    const first = listItemOf(line);
+    const first = c0 === 0x2d || c0 === 0x2a || (c0 >= 0x30 && c0 <= 0x39) ? listItemOf(line) : null;
     if (first !== null) {
       const items = [[trimLine(first.text)]];
       i++;
@@ -428,16 +482,24 @@ function renderMarkdown(src, env, slug) {
     if (excerpt === null) excerpt = inner;
     html += `<p>${inner}</p>\n`;
   }
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html, toc, excerpt: excerpt ?? '', words };
 }
 
-/** The characters a backslash escapes. */
-const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+/** The characters a backslash escapes, as a table over char codes (every one is ASCII). */
+const ESCAPABLE_TAB = new Uint8Array(128);
+for (const c of ['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']) ESCAPABLE_TAB[c.charCodeAt(0)] = 1;
+
+/** Whether the character at `i + 1` is one a backslash at `i` escapes. */
+function escapableAt(s, i) {
+  if (i + 1 >= s.length) return false;
+  const code = s.charCodeAt(i + 1);
+  return code < 128 && ESCAPABLE_TAB[code] === 1;
+}
 
 /** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
 function findUnescaped(s, what, from) {
   for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    if (s.charCodeAt(j) === 0x5c && escapableAt(s, j)) {
       j++;
       continue;
     }
@@ -450,7 +512,7 @@ function findUnescaped(s, what, from) {
 function findSingleStar(s, from) {
   for (let j = from; j < s.length; j++) {
     const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    if (c === '\\' && escapableAt(s, j)) {
       j++;
       continue;
     }
@@ -464,78 +526,87 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-/** Whether `code` stops a plain run of inline text: a construct opener or a character escaping rewrites. */
-function isInlineSpecial(code) {
-  return code === 0x5c || code === 0x60 || code === 0x2a || code === 0x5b || code === 0x26 || code === 0x3c || code === 0x3e || code === 0x22 || code === 0x27;
-}
+/** The characters that stop a plain run of inline text: a construct opener or a character escaping rewrites. */
+const INLINE_RE = /[\\`*[&<>"']/g;
 
-/** `s` rendered inline; `env.link(target)` is a link's href. Plain runs are copied whole between constructs. */
+/**
+ * `s` rendered inline; `env.link(target)` is a link's href. The regex engine steps from one special
+ * character to the next, so the plain runs between constructs are copied whole without a per-character
+ * scan in JavaScript. The shared regex's lastIndex is reset from `i` on every step, which keeps the
+ * recursive calls for emphasis and link text from disturbing the scan that called them.
+ */
 function inline(s, env) {
   let out = '';
   let i = 0;
   while (i < s.length) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) {
-      out += escapeHtml(s[i + 1]);
-      i += 2;
+    INLINE_RE.lastIndex = i;
+    const m = INLINE_RE.exec(s);
+    if (m === null) {
+      out += s.slice(i);
+      break;
+    }
+    const j = m.index;
+    if (j > i) out += s.slice(i, j);
+    const c = m[0];
+    if (c === '\\') {
+      if (escapableAt(s, j)) {
+        // Of the characters a backslash escapes, only ">" is one escaping rewrites.
+        out += s[j + 1] === '>' ? '&gt;' : s[j + 1];
+        i = j + 2;
+      } else {
+        out += '\\';
+        i = j + 1;
+      }
       continue;
     }
     if (c === '`') {
-      const j = s.indexOf('`', i + 1);
-      if (j > i + 1) {
-        out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`;
-        i = j + 1;
+      const k = s.indexOf('`', j + 1);
+      if (k > j + 1) {
+        out += `<code>${escapeHtml(s.slice(j + 1, k))}</code>`;
+        i = k + 1;
       } else {
         out += '`';
-        i++;
+        i = j + 1;
       }
       continue;
     }
     if (c === '*') {
-      if (s[i + 1] === '*') {
-        const j = findUnescaped(s, '**', i + 2);
-        if (j > i + 2) {
-          out += `<strong>${inline(s.slice(i + 2, j), env)}</strong>`;
-          i = j + 2;
+      if (s[j + 1] === '*') {
+        const k = findUnescaped(s, '**', j + 2);
+        if (k > j + 2) {
+          out += `<strong>${inline(s.slice(j + 2, k), env)}</strong>`;
+          i = k + 2;
         } else {
           out += '**';
-          i += 2;
+          i = j + 2;
         }
         continue;
       }
-      const j = findSingleStar(s, i + 1);
-      if (j > i + 1) {
-        out += `<em>${inline(s.slice(i + 1, j), env)}</em>`;
-        i = j + 1;
+      const k = findSingleStar(s, j + 1);
+      if (k > j + 1) {
+        out += `<em>${inline(s.slice(j + 1, k), env)}</em>`;
+        i = k + 1;
       } else {
         out += '*';
-        i++;
+        i = j + 1;
       }
       continue;
     }
     if (c === '[') {
-      const k = findUnescaped(s, ']', i + 1);
-      const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      const k = findUnescaped(s, ']', j + 1);
+      const e = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const target = e === -1 ? '' : s.slice(k + 2, e);
       if (target !== '' && !/\s/.test(target)) {
-        out += `<a href="${escapeHtml(env.link(target))}">${inline(s.slice(i + 1, k), env)}</a>`;
-        i = m + 1;
+        out += `<a href="${escapeHtml(env.link(target))}">${inline(s.slice(j + 1, k), env)}</a>`;
+        i = e + 1;
         continue;
       }
       out += '[';
-      i++;
+      i = j + 1;
       continue;
     }
-    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
-      out += ESCAPES[c];
-      i++;
-      continue;
-    }
-    // A plain run: everything up to the next construct opener or escapable character.
-    let j = i + 1;
-    while (j < s.length && !isInlineSpecial(s.charCodeAt(j))) j++;
-    out += s.slice(i, j);
-    i = j;
+    out += ESCAPES[c];
+    i = j + 1;
   }
   return out;
 }
@@ -734,9 +805,9 @@ const RESERVED = ['posts', 'tags', 'page'];
 
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 
-/** `rel` (a link's path, "/"-separated) from the directory `dir` of a source, or null when it climbs out of the root. */
-function resolvePath(dir, rel) {
-  const parts = dir === '' ? [] : dir.split('/');
+/** `rel` (a link's path, "/"-separated) from a source's directory parts, or null when it climbs out of the root. */
+function resolvePath(dirParts, rel) {
+  const parts = dirParts.slice();
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
     if (seg === '..') {
@@ -839,13 +910,14 @@ export function run(input) {
   const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
   for (const s of kept) {
     const dir = dirOf(s.path);
+    const dirParts = dir === '' ? [] : dir.split('/');
     const env = {
       link: (target) => {
         if (SCHEME.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
+        const path = rel === '' ? null : resolvePath(dirParts, rel);
         if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
         if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
         broken.add(`broken-link ${s.path} -> ${target}`);
@@ -856,6 +928,7 @@ export function run(input) {
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
+    s.words = md.words;
   }
 
   // 5. The posts, newest first and then by slug; each post's newer and older neighbours.
@@ -917,7 +990,7 @@ export function run(input) {
         date_long: s.data.date === undefined ? '' : longDate(s.data.date),
         summary: s.data.summary ?? '',
         excerpt: s.excerpt,
-        reading_minutes: Math.max(1, Math.ceil(countWords(s.body) / 200)),
+        reading_minutes: Math.max(1, Math.ceil(s.words / 200)),
         tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
       };
     }
